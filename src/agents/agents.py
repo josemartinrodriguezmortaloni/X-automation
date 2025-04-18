@@ -1,4 +1,5 @@
 from textwrap import dedent
+from typing import Iterator
 from agno.agent import Agent
 from agno.models.openai import OpenAIResponses
 from agno.utils.log import logger
@@ -400,3 +401,61 @@ class Agents(Workflow):
 
     def get_status_log(self):
         return self.memory.get_status_log()
+
+    def run(self, topic: str, use_cache: bool = True) -> Iterator[RunResponse]:
+        logger.info(f"Run({topic})")
+        iteration = 0
+
+        # 1) Draft ----------------------------------------------------------------
+        draft = self.get_initial_prompt(topic) if use_cache else None
+        if not draft:
+            self.log_status("Writer", "draft_requested")
+            draft_resp = self.publication_writer.run(topic, stream=False)
+            draft = draft_resp.content
+            self.cache_draft(topic, draft)
+            yield RunResponse(content=f"Draft:\n\n{draft}", event=RunEvent.run_response)
+        else:
+            yield RunResponse(content="Draft (cached) ", event=RunEvent.run_response)
+
+        # 2‑3) Loop: evaluate -> maybe revise -------------------------------------
+        approved = self.is_approved(topic)
+        while not approved:
+            # --- evaluación
+            evaluation = (
+                self.get_cached_evaluation(topic)
+                if use_cache and iteration == 0
+                else None
+            )
+            if not evaluation:
+                self.log_status("Evaluator", "evaluation_requested")
+                eval_resp = self.publication_evaluator.run(draft, stream=False)
+                evaluation = eval_resp.content
+                self.cache_evaluation(topic, evaluation)
+            yield RunResponse(
+                content=f"Evaluation:\n\n{evaluation}", event=RunEvent.run_response
+            )
+
+            # ¿aprobado?
+            if "Publish" in evaluation:  # o parsear tu «Decision: Publish»
+                self.mark_approved(topic)
+                approved = True
+                break
+
+            # --- no aprobado: pedir revisión
+            iteration += 1
+            self.log_status("Writer", f"revision_{iteration}_requested")
+            rev_prompt = f"{draft}\n\n### Feedback\n{evaluation}"
+            rev_resp = self.publication_writer.run(rev_prompt, stream=False)
+            draft = rev_resp.content
+            self.cache_revision(topic, draft, iteration)
+            yield RunResponse(
+                content=f"Revision {iteration}:\n\n{draft}", event=RunEvent.run_response
+            )
+
+        # 4) Publicación final -----------------------------------------------------
+        self.save_final_publication(topic, draft)
+        self.log_status("Publisher", "publish_requested")
+        pub_resp = self.publication_publisher.run(draft, stream=False)
+        yield RunResponse(
+            content=f"Published:\n\n{pub_resp.content}", event=RunEvent.run_response
+        )
