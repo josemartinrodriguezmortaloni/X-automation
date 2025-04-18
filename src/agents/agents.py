@@ -6,11 +6,12 @@ from agno.utils.log import logger
 from agno.workflow import RunEvent, RunResponse, Workflow
 from dotenv import load_dotenv
 from ..utils.memory import Memory
+from ..utils.tools import FileSystemTools
 
 load_dotenv()
 
 
-class Agents(Workflow):
+class PublicationWorkflow(Workflow):
     """Workflow for generating publications and chatting through dms for x using ia"""
 
     orchestrator: Agent = Agent(
@@ -111,6 +112,10 @@ class Agents(Workflow):
 
 
     """),
+        reasoning=True,
+        tools=[FileSystemTools()],
+        markdown=True,
+        show_tool_calls=True,
     )
 
     publication_writer: Agent = Agent(
@@ -148,7 +153,7 @@ class Agents(Workflow):
 
         ### 5. Final
 
-        Deliver a polished, user-ready prompt as output and confirm all requirements are met prior to termination.
+        Deliver a polished, user-ready publication as output and confirm all requirements are met prior to termination.
 
         ---
 
@@ -198,9 +203,11 @@ class Agents(Workflow):
 
         - Always reason via the Thought, Plan, Action, and Observation sections.
         - Only use tool calls to manipulate files or directories.
-        - Do not end your session until a fully refined prompt is produced, saved, and confirmed by the user.
+        - Do not end your session until a fully refined publication is produced, saved, and confirmed by the user.
 
     """),
+        markdown=True,
+        show_tool_calls=True,
     )
     publication_evaluator: Agent = Agent(
         model=OpenAIResponses(id="o4-mini"),
@@ -265,6 +272,8 @@ class Agents(Workflow):
         - Correct the model to reflect that the *earth revolves around the sun* (heliocentric model).
         - Cite reputable sources for astronomical facts.
     """),
+        markdown=True,
+        show_tool_calls=True,
     )
     publication_publisher: Agent = Agent(
         model=OpenAIResponses(id="gpt-4o"),
@@ -351,13 +360,20 @@ class Agents(Workflow):
 
         - Always reason via the Thought, Plan, Action, and Observation sections.
         - Only use tool calls to manipulate files or directories.
-        - Do not end your session until a fully refined prompt is produced, saved, and confirmed by the user.
+        - Do not end your session until a fully refined publication is produced, saved, and confirmed by the user.
     """),
+        markdown=True,
+        show_tool_calls=True,
     )
 
-    def __init__(self):
-        # Initialize persistent/session memory manager
-        self.memory: Memory = Memory()
+    def __init__(
+        self, session_id: str | None = None, debug_mode: bool = False, **kwargs
+    ):
+        # Llama al constructor de Workflow (que espera session_id, debug_mode, etc.)
+        super().__init__(session_id=session_id, debug_mode=debug_mode, **kwargs)
+
+        # Tu inicialización propia
+        self.memory: Memory = Memory(session_id=session_id)
 
     # ---------------- Memory convenience wrappers ---------------- #
 
@@ -452,10 +468,26 @@ class Agents(Workflow):
                 content=f"Revision {iteration}:\n\n{draft}", event=RunEvent.run_response
             )
 
-        # 4) Publicación final -----------------------------------------------------
-        self.save_final_publication(topic, draft)
+        # 4) Publicación -----------------------------------------------------------
         self.log_status("Publisher", "publish_requested")
         pub_resp = self.publication_publisher.run(draft, stream=False)
+        published_content = pub_resp.content
         yield RunResponse(
-            content=f"Published:\n\n{pub_resp.content}", event=RunEvent.run_response
+            content=f"Published:\n\n{published_content}", event=RunEvent.run_response
         )
+
+        # 5) Evaluación post‑publicación ------------------------------------------
+        self.log_status("Evaluator", "post_publish_evaluation_requested")
+        post_eval_resp = self.publication_evaluator.run(published_content, stream=False)
+        post_evaluation = post_eval_resp.content
+        yield RunResponse(
+            content=f"Post‑publish Evaluation:\n\n{post_evaluation}",
+            event=RunEvent.run_response,
+        )
+
+        # Guardar solo si la evaluación final es positiva
+        if "Publish" in post_evaluation:
+            self.save_final_publication(topic, published_content)
+            self.log_status("Orchestrator", "publication_saved")
+        else:
+            self.log_status("Orchestrator", "post_publish_evaluation_failed")

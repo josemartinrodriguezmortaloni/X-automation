@@ -3,8 +3,9 @@ import os
 from typing import Dict, Optional
 from datetime import datetime
 from agno.storage.sqlite import SqliteStorage
-from agno.utils import logger
+from agno.utils.log import logger
 from pydantic import BaseModel, Field
+from agno.memory import AgentMemory
 
 
 class Publication(BaseModel):
@@ -37,19 +38,32 @@ class PublicationEvaluation(BaseModel):
     )
 
 
-class Memory:
+class Memory(AgentMemory):
     def __init__(self, *args, session_id=None, storage=None, **kwargs):
         if storage is None:
             storage = SqliteStorage(
                 table_name="publication_generation_workflow",
-                db_file="tmp/publication_generated.db",
+                db_file="src/db/publication_generated.db",
             )
 
-        if session_id is not None:
-            kwargs["storage"] = storage
+        # Propaga storage y session_id al constructor base para que AgentMemory
+        # cree correctamente la sesión interna.
         kwargs["storage"] = storage
+        if session_id is not None:
+            kwargs["session_id"] = session_id
+
         super().__init__(*args, **kwargs)
-        self.final_publication_table = self.storage.get_table()
+
+        # Ensure storage is accessible via `self.storage` regardless of how AgentMemory stores it
+        if not hasattr(self, "storage"):
+            # Pydantic models are attribute‑restricted; bypass with object.__setattr__
+            object.__setattr__(self, "storage", storage)
+
+        # Guarantee there is a mutable dict to hold the in‑memory session cache
+        if not hasattr(self, "session_state"):
+            object.__setattr__(self, "session_state", {})
+
+        object.__setattr__(self, "final_publication_table", self.storage.get_table())
         logger.info("Ensured 'final_publication' table exists for permanent storage")
 
     # --- Explicit cache methods for each phase ---
@@ -86,36 +100,19 @@ class Memory:
         self.session_state.setdefault("final_publications", {})[topic] = publication
 
         try:
-            # Use SqliteStorage helper if available
-            if hasattr(self.final_publication_table, "insert"):
-                # delete any existing row first (simple approach)
-                try:
-                    self.final_publication_table.delete().where(
-                        self.final_publication_table.c.topic == topic
-                    ).execute()
-                except Exception:
-                    # Might not exist – ignore
-                    pass
-                self.final_publication_table.insert(
-                    {
-                        "topic": topic,
-                        "final_publication": publication,
-                        "timestamp": datetime.utcnow().isoformat(),
-                    }
-                ).execute()
-            else:
-                # Fallback – execute raw SQL
-                sql = """CREATE TABLE IF NOT EXISTS final_publication (
-                            topic TEXT PRIMARY KEY,
-                            final_publication TEXT,
-                            timestamp TEXT
-                        );"""
-                self.storage.execute(sql)
-                upsert_sql = """INSERT OR REPLACE INTO final_publication (topic, final_publication, timestamp)
-                               VALUES (?, ?, ?);"""
-                self.storage.execute(
-                    upsert_sql, (topic, publication, datetime.utcnow().isoformat())
-                )
+            # Always use raw SQL because SQLAlchemy's TableClause.insert(**dict) signature changed
+            sql = """CREATE TABLE IF NOT EXISTS final_publication (
+                        topic TEXT PRIMARY KEY,
+                        final_publication TEXT,
+                        timestamp TEXT
+                    );"""
+            self.storage.execute(sql)
+
+            upsert_sql = """INSERT OR REPLACE INTO final_publication (topic, final_publication, timestamp)
+                           VALUES (?, ?, ?);"""
+            self.storage.execute(
+                upsert_sql, (topic, publication, datetime.utcnow().isoformat())
+            )
         except Exception as e:
             logger.error(f"Failed to save final publication for topic '{topic}': {e}")
 
