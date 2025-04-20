@@ -1,9 +1,12 @@
 from src.agents.agents import PublicationWorkflow
-from typing import Iterator
 from agno.utils.pprint import pprint_run_response
+from typing import Iterator
 from agno.workflow import RunResponse
 import random
 from rich.prompt import Prompt
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -30,16 +33,14 @@ def main():
 
             # Initialize the prompt generator workflow
             generate_publications = PublicationWorkflow(
-                session_id=f"generate-publication-on-{url_safe_topic}", debug_mode=True
+                session_id=f"generate-publication-on-{url_safe_topic}"
             )
 
             # Execute the workflow
-            prompt_response_iterator: Iterator[RunResponse] = generate_publications.run(
-                topic=topic
-            )
+            result: Iterator[RunResponse] = generate_publications.run(topic=topic)
 
             # Print the response for each phase separately
-            for phase_response in prompt_response_iterator:
+            for phase_response in result:
                 pprint_run_response(phase_response, markdown=True)
 
 

@@ -1,22 +1,40 @@
 from textwrap import dedent
-from typing import Iterator
 from agno.agent import Agent
 from agno.models.openai import OpenAIResponses
-from agno.utils.log import logger
-from agno.workflow import RunEvent, RunResponse, Workflow
+from agno.workflow import Workflow, RunResponse, RunEvent
 from dotenv import load_dotenv
-from ..utils.memory import Memory
 from ..utils.tools import FileSystemTools
+from agno.utils.log import logger
+from ..utils.memory import Memory
+from pydantic import BaseModel, Field
+from datetime import datetime
+from agno.tools.reasoning import ReasoningTools
+from typing import Optional, Iterator
 
 load_dotenv()
+
+
+class Publication(BaseModel):
+    """Model for storing the final generated publication permanently"""
+
+    topic: str = Field(..., description="The original topic for the publication")
+    final_publication: str = Field(
+        ..., description="The final, improved and aproved publication."
+    )
+    timestamp: datetime = Field(
+        default_factory=datetime.utcnow, description="When the publication was saved"
+    )
 
 
 class PublicationWorkflow(Workflow):
     """Workflow for generating publications and chatting through dms for x using ia"""
 
     orchestrator: Agent = Agent(
-        model=OpenAIResponses(id="o3"),
-        instructions=dedent("""\
+        name="Orchestrator",
+        role="Orchestrate all the members of the content creation team",
+        model=OpenAIResponses(id="o4-mini"),
+        instructions=dedent(
+            """\
     ## Overview
     You are the **Orchestrator**, an AI agent responsible for administrating and coordinating a publication workflow consisting of three specialized agents:
     - **Publication Writer**: Generates publication content.
@@ -109,18 +127,19 @@ class PublicationWorkflow(Workflow):
     - Encourage proactive collaboration.
     - Document all decisions, feedback, and status updates.
     - Act swiftly to unblock delays and optimize process efficiency.
-
-
-    """),
-        reasoning=True,
+             """
+        ),
         tools=[FileSystemTools()],
         markdown=True,
         show_tool_calls=True,
     )
 
     publication_writer: Agent = Agent(
+        name="Writer",
+        role="Generates engaging drafts for social network X",
         model=OpenAIResponses(id="gpt-4.1"),
-        instructions=dedent("""\
+        instructions=dedent(
+            """\
                     
         ## Preamble
 
@@ -205,13 +224,17 @@ class PublicationWorkflow(Workflow):
         - Only use tool calls to manipulate files or directories.
         - Do not end your session until a fully refined publication is produced, saved, and confirmed by the user.
 
-    """),
+    """
+        ),
         markdown=True,
         show_tool_calls=True,
     )
     publication_evaluator: Agent = Agent(
-        model=OpenAIResponses(id="o4-mini"),
-        instructions=dedent("""\
+        name="Evaluator",
+        role="Assesses drafts and decides Publish / Do Not Publish with actionable feedback",
+        model=OpenAIResponses(id="gpt-4.1"),
+        instructions=dedent(
+            """\
 
 
         ## Role & Objective
@@ -271,20 +294,24 @@ class PublicationWorkflow(Workflow):
         **Feedback & Suggestions:**
         - Correct the model to reflect that the *earth revolves around the sun* (heliocentric model).
         - Cite reputable sources for astronomical facts.
-    """),
+    """
+        ),
+        tools=[ReasoningTools(add_instructions=True)],
         markdown=True,
         show_tool_calls=True,
     )
     publication_publisher: Agent = Agent(
-        model=OpenAIResponses(id="gpt-4o"),
-        instructions=dedent("""\
+        name="Publisher",
+        role="Formats and publishes the approved content to X, returning confirmation",
+        model=OpenAIResponses(id="gpt-4.1"),
+        instructions=dedent(
+            """\
 
         ## Preamble
 
         You are an autonomous GPT-4.1 agent. You must independently plan, reason, act, and persist through the workflow until the task is fully complete and confirmed. Rely on structured reasoning and explicit tool usage for all external operations. Only terminate your process when the prompt is fully refined, saved in the designated directory, and you have user confirmation.
 
         ---
-
         ## Workflow Sections
 
         ### 1. Thought
@@ -361,133 +388,108 @@ class PublicationWorkflow(Workflow):
         - Always reason via the Thought, Plan, Action, and Observation sections.
         - Only use tool calls to manipulate files or directories.
         - Do not end your session until a fully refined publication is produced, saved, and confirmed by the user.
-    """),
+    """
+        ),
         markdown=True,
         show_tool_calls=True,
     )
 
-    def __init__(
-        self, session_id: str | None = None, debug_mode: bool = False, **kwargs
-    ):
-        # Llama al constructor de Workflow (que espera session_id, debug_mode, etc.)
-        super().__init__(session_id=session_id, debug_mode=debug_mode, **kwargs)
+    # --- Cache methods fro each phase --- #
+    def get_cached_initial_publication(topic: str) -> Optional[str]:
+        session_state = Memory.get_cached_initial_publication(topic)
+        return session_state
 
-        # Tu inicialización propia
-        self.memory: Memory = Memory(session_id=session_id)
+    def add_initial_publication_to_cache(topic: str, data: str):
+        add_draft_to_cache = Memory.add_initial_publication_to_cache(topic, data)
+        return add_draft_to_cache
 
-    # ---------------- Memory convenience wrappers ---------------- #
+    def get_planened_publication(self, topic: str) -> Optional[str]:
+        planned_publication = Memory.get_planened_publication(topic)
+        return planned_publication
 
-    # Initial prompts
-    def cache_initial_prompt(self, topic: str, prompt: str):
-        self.memory.add_initial_prompt_to_cache(topic, prompt)
+    def add_planened_publication(self, topic: str) -> Optional[str]:
+        add_planened_publication = Memory.add_planened_publication(topic)
+        return add_planened_publication
 
-    def get_initial_prompt(self, topic: str):
-        return self.memory.get_cached_initial_prompt(topic)
+    def get_cached_evaluation(topic: str) -> Optional[str]:
+        cached_evaluation = Memory.get_cached_evaluation(topic)
+        return cached_evaluation
 
-    # Drafts & revisions
-    def cache_draft(self, topic: str, draft: str):
-        self.memory.add_draft_to_cache(topic, draft)
+    def add_evaluation_to_cache(topic: str, data: str):
+        add_evaluation = Memory.add_evaluation_to_cache(topic, data)
+        return add_evaluation
 
-    def cache_revision(self, topic: str, content: str, iteration: int):
-        self.memory.add_revision_to_cache(topic, content, iteration)
+    def get_cached_improved_publication(topic: str) -> Optional[str]:
+        cached_improved_publication = Memory.get_cached_improved_publication(topic)
+        return cached_improved_publication
 
-    def get_revision_history(self, topic: str):
-        return self.memory.get_revision_history(topic)
+    def add_improved_publication_to_cache(topic: str, data: str):
+        add_improved_publication_to_cache = Memory.add_improved_publication_to_cache(
+            topic, data
+        )
+        return add_improved_publication_to_cache
 
-    # Evaluations
-    def cache_evaluation(self, topic: str, evaluation: str):
-        self.memory.add_evaluation_to_cache(topic, evaluation)
+    def save_final_publication(topic: str, publication: str) -> None:
+        final_publication_saved = Memory.save_final_publication(topic, publication)
+        return final_publication_saved
 
-    def get_cached_evaluation(self, topic: str):
-        return self.memory.get_cached_evaluation(topic)
+    def get_final_publication(self, topic: str) -> Optional[Publication]:
+        final_publication = Memory.get_final_publication(topic)
+        return final_publication
 
-    # Approvals & final publications
-    def mark_approved(self, topic: str):
-        self.memory.mark_topic_as_approved(topic)
+    def list_final_publications(self, limit: int = 50, offset: int = 0):
+        final_publications = Memory.list_final_publications(limit, offset)
+        return final_publications
 
-    def is_approved(self, topic: str) -> bool:
-        return self.memory.is_topic_approved(topic)
-
-    def save_final_publication(self, topic: str, publication: str):
-        self.memory.save_final_publication(topic, publication)
-
-    # Status log
-    def log_status(self, agent: str, stage: str):
-        self.memory.log_status(agent, stage)
-
-    def get_status_log(self):
-        return self.memory.get_status_log()
+    def delete_final_publication(self, topic: str) -> bool:
+        delete_publication = Memory.delete_final_publication(topic)
+        return delete_publication
 
     def run(self, topic: str, use_cache: bool = True) -> Iterator[RunResponse]:
-        logger.info(f"Run({topic})")
-        iteration = 0
+        logger.debug(f"Generating publication on: {topic} (Session Cache: {use_cache})")
+        generate_publication_content = Optional[str] = None
+        evalution_publication_content = Optional[str] = None
+        improve_publication_content = Optional[str] = None
 
-        # 1) Draft ----------------------------------------------------------------
-        draft = self.get_initial_prompt(topic) if use_cache else None
-        if not draft:
-            self.log_status("Writer", "draft_requested")
-            draft_resp = self.publication_writer.run(topic, stream=False)
-            draft = draft_resp.content
-            self.cache_draft(topic, draft)
-            yield RunResponse(content=f"Draft:\n\n{draft}", event=RunEvent.run_response)
-        else:
-            yield RunResponse(content="Draft (cached) ", event=RunEvent.run_response)
+        logger.debug(f"Getting initial publications from cache {topic}")
+        chaded_initial_publication = self.get_cached_initial_publication(topic)
 
-        # 2‑3) Loop: evaluate -> maybe revise -------------------------------------
-        approved = self.is_approved(topic)
-        while not approved:
-            # --- evaluación
-            evaluation = (
-                self.get_cached_evaluation(topic)
-                if use_cache and iteration == 0
-                else None
-            )
-            if not evaluation:
-                self.log_status("Evaluator", "evaluation_requested")
-                eval_resp = self.publication_evaluator.run(draft, stream=False)
-                evaluation = eval_resp.content
-                self.cache_evaluation(topic, evaluation)
-            yield RunResponse(
-                content=f"Evaluation:\n\n{evaluation}", event=RunEvent.run_response
-            )
-
-            # ¿aprobado?
-            if "Publish" in evaluation:  # o parsear tu «Decision: Publish»
-                self.mark_approved(topic)
-                approved = True
-                break
-
-            # --- no aprobado: pedir revisión
-            iteration += 1
-            self.log_status("Writer", f"revision_{iteration}_requested")
-            rev_prompt = f"{draft}\n\n### Feedback\n{evaluation}"
-            rev_resp = self.publication_writer.run(rev_prompt, stream=False)
-            draft = rev_resp.content
-            self.cache_revision(topic, draft, iteration)
-            yield RunResponse(
-                content=f"Revision {iteration}:\n\n{draft}", event=RunEvent.run_response
-            )
-
-        # 4) Publicación -----------------------------------------------------------
-        self.log_status("Publisher", "publish_requested")
-        pub_resp = self.publication_publisher.run(draft, stream=False)
-        published_content = pub_resp.content
-        yield RunResponse(
-            content=f"Published:\n\n{published_content}", event=RunEvent.run_response
+        # --- Phase 1: Plan the content to generate --- #
+        plan: Iterator[RunResponse] = self.orchestrator.run(
+            topic, stream=True, markdown=True
         )
+        logger.debug(f"Getting initial publications from cache {topic}")
+        chaded_initial_publication = (
 
-        # 5) Evaluación post‑publicación ------------------------------------------
-        self.log_status("Evaluator", "post_publish_evaluation_requested")
-        post_eval_resp = self.publication_evaluator.run(published_content, stream=False)
-        post_evaluation = post_eval_resp.content
-        yield RunResponse(
-            content=f"Post‑publish Evaluation:\n\n{post_evaluation}",
-            event=RunEvent.run_response,
+            self.get_cached_initial_publication(topic) if use_cache else None
         )
+        if cached_initial_publication:
+            logger.debug(f"Using cached initial publication: {cached_initial_publication}")
+            generate_publication_content = cached_initial_publication
+            yield RunResponse(content=f"# Initial Publication (cached) \n\n {generate_publication_content}"), event = RunEvent.run_response)
+        else: 
+            logger.info("Generating plan for publication")
+            orchestrator_input = {
+                "topic": topic,
+                "task": "Create a plan for a team thats creates content for X based on this topic",
+                "requirements": {
+                    "format": "markdown",
+                    "structure": "cluear sections",
+                    "style": "eganging",
+                }
+            }
+            try:
+                plan: Optional[RunReponse] = (self.orchestrator.run(json.dumps(orchestrator_input, ident=4), stream=True)
+                if not plan or not plan.content:
+                    raise ValueError("Agent (Phase 1) did not return content.")
+                plan_contetn = plan.content
+                self.add_initial_publication_to_cache(topic, plan_content)
+                yield RunResponse(content=f"# Plan for Publication (cached) \n\n {plan_content}"), event = RunEvent.run_response)
+            except Exception as e:
+                logger.error(f"Error during plan generation: {e}")
+                yield RunResponse(
+                    content=f"Error: Failed to generate the plan.\nDetails: {e}",
+                    event=RunEvent.run_error,
+                )
+                return
 
-        # Guardar solo si la evaluación final es positiva
-        if "Publish" in post_evaluation:
-            self.save_final_publication(topic, published_content)
-            self.log_status("Orchestrator", "publication_saved")
-        else:
-            self.log_status("Orchestrator", "post_publish_evaluation_failed")

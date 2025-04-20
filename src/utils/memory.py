@@ -1,5 +1,3 @@
-import json
-import os
 from typing import Dict, Optional
 from datetime import datetime
 from agno.storage.sqlite import SqliteStorage
@@ -42,38 +40,32 @@ class Memory(AgentMemory):
     def __init__(self, *args, session_id=None, storage=None, **kwargs):
         if storage is None:
             storage = SqliteStorage(
-                table_name="publication_generation_workflow",
-                db_file="src/db/publication_generated.db",
+                table_name="publication_generation_workflows",
+                db_file="src/db/publication_generation.db",
             )
-
-        # Propaga storage y session_id al constructor base para que AgentMemory
-        # cree correctamente la sesión interna.
-        kwargs["storage"] = storage
         if session_id is not None:
             kwargs["session_id"] = session_id
-
+        kwargs["storage"] = storage
         super().__init__(*args, **kwargs)
-
-        # Ensure storage is accessible via `self.storage` regardless of how AgentMemory stores it
-        if not hasattr(self, "storage"):
-            # Pydantic models are attribute‑restricted; bypass with object.__setattr__
-            object.__setattr__(self, "storage", storage)
-
-        # Guarantee there is a mutable dict to hold the in‑memory session cache
-        if not hasattr(self, "session_state"):
-            object.__setattr__(self, "session_state", {})
-
-        object.__setattr__(self, "final_publication_table", self.storage.get_table())
-        logger.info("Ensured 'final_publication' table exists for permanent storage")
+        self.final_publications_table = self.storage.get_table()
+        logger.info("Ensured 'final_publications' table exists for permanent storage.")
 
     # --- Explicit cache methods for each phase ---
-    def get_cached_initial_prompt(self, topic: str) -> Optional[str]:
-        logger.debug(f"Checking cache for topic '{topic}' - initial_prompt phase")
-        return self.session_state.get("initial_prompts", {}).get(topic)
+    def get_cached_initial_publication(self, topic: str) -> Optional[str]:
+        logger.debug(f"Checking cache for topic '{topic}' - initial_publication phase")
+        return self.session_state.get("initial_publications", {}).get(topic)
 
-    def add_initial_prompt_to_cache(self, topic: str, data: str):
-        logger.debug(f"Caching initial prompt for topic '{topic}'")
-        self.session_state.setdefault("initial_prompts", {})[topic] = data
+    def add_initial_publication_to_cache(self, topic: str, data: str):
+        logger.debug(f"Caching initial publication for topic '{topic}'")
+        self.session_state.setdefault("initial_publications", {})[topic] = data
+
+    def get_planened_publication(self, topic: str) -> Optional[str]:
+        logger.debug(f"Checking cache for topic '{topic}' - planned_publication phase")
+        return self.session_state.get("planned_publications", {}).get(topic)
+
+    def add_planened_publication(self, topic: str) -> Optional[str]:
+        logger.debug(f"Caching planned publication for topic '{topic}'")
+        return self.session_state.setdefault("planned_publications", {}).get(topic)
 
     def get_cached_evaluation(self, topic: str) -> Optional[str]:
         logger.debug(f"Checking cache for topic '{topic}' - evaluation phase")
@@ -83,13 +75,13 @@ class Memory(AgentMemory):
         logger.debug(f"Caching evaluation for topic '{topic}'")
         self.session_state.setdefault("evaluations", {})[topic] = data
 
-    def get_cached_improved_prompt(self, topic: str) -> Optional[str]:
-        logger.debug(f"Checking cache for topic '{topic}' - improved_prompt phase")
-        return self.session_state.get("improved_prompts", {}).get(topic)
+    def get_cached_improved_publication(self, topic: str) -> Optional[str]:
+        logger.debug(f"Checking cache for topic '{topic}' - improved_publication phase")
+        return self.session_state.get("improved_publications", {}).get(topic)
 
-    def add_improved_prompt_to_cache(self, topic: str, data: str):
-        logger.debug(f"Caching improved prompt for topic '{topic}'")
-        self.session_state.setdefault("improved_prompts", {})[topic] = data
+    def add_improved_publication_to_cache(self, topic: str, data: str):
+        logger.debug(f"Caching improved publication for topic '{topic}'")
+        self.session_state.setdefault("improved_publications", {})[topic] = data
 
     def save_final_publication(self, topic: str, publication: str) -> None:
         """Persist the *approved* publication in the long‑term SQLite store.
@@ -210,58 +202,3 @@ class Memory(AgentMemory):
         # Remove from in‑memory cache
         self.session_state.get("final_publications", {}).pop(topic, None)
         return removed
-
-    # ---------- Session cache helpers ----------
-    def get_cached_draft(self, topic: str) -> Optional[str]:
-        return self.session_state.get("drafts", {}).get(topic)
-
-    def add_draft_to_cache(self, topic: str, draft: str):
-        self.session_state.setdefault("drafts", {})[topic] = draft
-
-    def add_revision_to_cache(self, topic: str, content: str, iteration: int):
-        revisions = self.session_state.setdefault("revisions", {}).setdefault(topic, [])
-        revisions.append(
-            {
-                "iteration": iteration,
-                "content": content,
-                "timestamp": datetime.utcnow().isoformat(),
-            }
-        )
-
-    def get_revision_history(self, topic: str):
-        return self.session_state.get("revisions", {}).get(topic, [])
-
-    def mark_topic_as_approved(self, topic: str):
-        self.session_state.setdefault("approvals", {})[topic] = True
-
-    def is_topic_approved(self, topic: str) -> bool:
-        return self.session_state.get("approvals", {}).get(topic, False)
-
-    # ---------- Workflow status log ----------
-    def log_status(self, agent: str, stage: str, timestamp: Optional[datetime] = None):
-        timestamp = timestamp or datetime.utcnow()
-        self.session_state.setdefault("status_log", []).append(
-            {"agent": agent, "stage": stage, "timestamp": timestamp.isoformat()}
-        )
-
-    def get_status_log(self, topic: Optional[str] = None):
-        # Currently no topic filtering; could be enhanced by including topic in log entries
-        return self.session_state.get("status_log", [])
-
-    # ---------- Utility helpers ----------
-    def reset_session(self):
-        self.session_state.clear()
-
-    def topic_exists(self, topic: str) -> bool:
-        return self.get_final_publication(topic) is not None
-
-    def export_to_json(self, path: str):
-        import json
-
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.session_state, f, ensure_ascii=False, indent=2)
-
-    def import_from_json(self, path: str):
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                self.session_state = json.load(f)
