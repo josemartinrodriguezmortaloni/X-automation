@@ -4,6 +4,7 @@ from agno.storage.sqlite import SqliteStorage
 from agno.utils.log import logger
 from pydantic import BaseModel, Field
 from agno.memory import AgentMemory
+import sqlite3
 
 
 class Publication(BaseModel):
@@ -47,8 +48,16 @@ class Memory(AgentMemory):
             kwargs["session_id"] = session_id
         kwargs["storage"] = storage
         super().__init__(*args, **kwargs)
-        self.final_publications_table = self.storage.get_table()
-        logger.info("Ensured 'final_publications' table exists for permanent storage.")
+
+        # Pydantic immutability workaround: attach storage & table explicitly
+        object.__setattr__(self, "storage", storage)
+        object.__setattr__(self, "final_prompts_table", storage.get_table())
+
+        # Guarantee an in‑memory dict for caching if AgentMemory didn't create one
+        if not hasattr(self, "session_state"):
+            object.__setattr__(self, "session_state", {})
+
+        logger.info("Ensured 'final_prompts' table exists for permanent storage.")
 
     # --- Explicit cache methods for each phase ---
     def get_cached_initial_publication(self, topic: str) -> Optional[str]:
@@ -59,13 +68,13 @@ class Memory(AgentMemory):
         logger.debug(f"Caching initial publication for topic '{topic}'")
         self.session_state.setdefault("initial_publications", {})[topic] = data
 
-    def get_planened_publication(self, topic: str) -> Optional[str]:
+    def get_planned_publication(self, topic: str) -> Optional[str]:
         logger.debug(f"Checking cache for topic '{topic}' - planned_publication phase")
         return self.session_state.get("planned_publications", {}).get(topic)
 
-    def add_planened_publication(self, topic: str) -> Optional[str]:
+    def add_planened_publication(self, topic: str, data: str):
         logger.debug(f"Caching planned publication for topic '{topic}'")
-        return self.session_state.setdefault("planned_publications", {}).get(topic)
+        self.session_state.setdefault("planned_publications", {})[topic] = data
 
     def get_cached_evaluation(self, topic: str) -> Optional[str]:
         logger.debug(f"Checking cache for topic '{topic}' - evaluation phase")
@@ -84,58 +93,90 @@ class Memory(AgentMemory):
         self.session_state.setdefault("improved_publications", {})[topic] = data
 
     def save_final_publication(self, topic: str, publication: str) -> None:
-        """Persist the *approved* publication in the long‑term SQLite store.
-
-        If the topic already exists it will be *replaced* (upsert semantics).
-        """
-        # Store also in memory for quick access
+        """Upsert the approved publication into *final_prompts* table."""
+        logger.debug(f"[Memory] save_final_publication called for topic: {topic}")
+        # In-memory cache
         self.session_state.setdefault("final_publications", {})[topic] = publication
+        logger.debug(
+            f"[Memory] session_state final_publications updated for topic: {topic}"
+        )
 
         try:
-            # Always use raw SQL because SQLAlchemy's TableClause.insert(**dict) signature changed
-            sql = """CREATE TABLE IF NOT EXISTS final_publication (
-                        topic TEXT PRIMARY KEY,
-                        final_publication TEXT,
-                        timestamp TEXT
-                    );"""
-            self.storage.execute(sql)
+            logger.debug(
+                f"[Memory] Connecting to SQLite DB for final_prompts upsert (topic={topic})"
+            )
+            # Use raw SQLite connection (works regardless of SQLAlchemy presence)
+            # Determine DB file path from storage or default
+            db_path = "src/db/publication_generation.db"
+            logger.debug(f"[Memory] DB path set to {db_path}")
 
-            upsert_sql = """INSERT OR REPLACE INTO final_publication (topic, final_publication, timestamp)
-                           VALUES (?, ?, ?);"""
-            self.storage.execute(
-                upsert_sql, (topic, publication, datetime.utcnow().isoformat())
+            conn = sqlite3.connect(db_path)
+            logger.debug(f"[Memory] SQLite connection established at {db_path}")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS final_prompts (
+                    topic TEXT PRIMARY KEY,
+                    final_prompt TEXT,
+                    timestamp TEXT
+                );
+                """
+            )
+            conn.execute(
+                """INSERT OR REPLACE INTO final_prompts (topic, final_prompt, timestamp)
+                   VALUES (?, ?, ?);""",
+                (topic, publication, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+            logger.debug(
+                f"[Memory] commit successful for save_final_publication topic: {topic}"
             )
         except Exception as e:
             logger.error(f"Failed to save final publication for topic '{topic}': {e}")
 
     def get_final_publication(self, topic: str) -> Optional[Publication]:
         """Return a *Publication* record from permanent storage (or None)."""
-        # Check in‑memory cache first
+        logger.debug(f"[Memory] get_final_publication called for topic: {topic}")
+        # Check in-memory cache first
         if topic in self.session_state.get("final_publications", {}):
+            logger.debug(
+                f"[Memory] Final publication found in session_state for topic: {topic}"
+            )
             return Publication(
                 topic=topic,
                 final_publication=self.session_state["final_publications"][topic],
             )
 
         try:
-            if hasattr(self.final_publication_table, "select"):
+            logger.debug(
+                f"[Memory] Querying DB for final_publication for topic: {topic}"
+            )
+            if hasattr(self.final_prompts_table, "select"):
                 row = (
-                    self.final_publication_table.select()
-                    .where(self.final_publication_table.c.topic == topic)
+                    self.final_prompts_table.select()
+                    .where(self.final_prompts_table.c.topic == topic)
                     .execute()
                     .fetchone()
                 )
                 if row:
+                    logger.debug(
+                        f"[Memory] Retrieved final_publication from table for topic: {topic}"
+                    )
                     return Publication(
                         topic=row["topic"],
-                        final_publication=row["final_publication"],
+                        final_publication=row["final_prompt"],
                         timestamp=datetime.fromisoformat(row["timestamp"]),
                     )
             else:
-                sql = "SELECT topic, final_publication, timestamp FROM final_publication WHERE topic = ?;"
+                logger.debug(
+                    f"[Memory] Using raw SQL to fetch final_publication for topic: {topic}"
+                )
+                sql = "SELECT topic, final_prompt, timestamp FROM final_prompts WHERE topic = ?;"
                 cur = self.storage.execute(sql, (topic,))
                 row = cur.fetchone()
                 if row:
+                    logger.debug(
+                        f"[Memory] Retrieved final_publication via raw SQL for topic: {topic}"
+                    )
                     return Publication(
                         topic=row[0],
                         final_publication=row[1],
@@ -147,12 +188,15 @@ class Memory(AgentMemory):
 
     def list_final_publications(self, limit: int = 50, offset: int = 0):
         """Return a list of *Publication* objects ordered by timestamp desc."""
+        logger.debug(
+            f"[Memory] list_final_publications called with limit={limit}, offset={offset}"
+        )
         publications = []
         try:
-            if hasattr(self.final_publication_table, "select"):
+            if hasattr(self.final_prompts_table, "select"):
                 rows = (
-                    self.final_publication_table.select()
-                    .order_by(self.final_publication_table.c.timestamp.desc())
+                    self.final_prompts_table.select()
+                    .order_by(self.final_prompts_table.c.timestamp.desc())
                     .limit(limit)
                     .offset(offset)
                     .execute()
@@ -162,13 +206,13 @@ class Memory(AgentMemory):
                     publications.append(
                         Publication(
                             topic=r["topic"],
-                            final_publication=r["final_publication"],
+                            final_publication=r["final_prompt"],
                             timestamp=datetime.fromisoformat(r["timestamp"]),
                         )
                     )
             else:
-                sql = """SELECT topic, final_publication, timestamp
-                         FROM final_publication ORDER BY timestamp DESC LIMIT ? OFFSET ?"""
+                sql = """SELECT topic, final_prompt, timestamp
+                         FROM final_prompts ORDER BY timestamp DESC LIMIT ? OFFSET ?"""
                 cur = self.storage.execute(sql, (limit, offset))
                 for row in cur.fetchall():
                     publications.append(
@@ -180,25 +224,32 @@ class Memory(AgentMemory):
                     )
         except Exception as e:
             logger.error(f"Error listing final publications: {e}")
+        logger.debug(
+            f"[Memory] list_final_publications returning {len(publications)} publications"
+        )
         return publications
 
     def delete_final_publication(self, topic: str) -> bool:
         """Remove a publication from permanent storage. Returns *True* if deleted.*"""
+        logger.debug(f"[Memory] delete_final_publication called for topic: {topic}")
         removed = False
         try:
-            if hasattr(self.final_publication_table, "delete"):
+            if hasattr(self.final_prompts_table, "delete"):
                 result = (
-                    self.final_publication_table.delete()
-                    .where(self.final_publication_table.c.topic == topic)
+                    self.final_prompts_table.delete()
+                    .where(self.final_prompts_table.c.topic == topic)
                     .execute()
                 )
                 removed = result.rowcount > 0 if hasattr(result, "rowcount") else True
             else:
-                sql = "DELETE FROM final_publication WHERE topic = ?;"
+                sql = "DELETE FROM final_prompts WHERE topic = ?;"
                 cur = self.storage.execute(sql, (topic,))
                 removed = cur.rowcount > 0 if hasattr(cur, "rowcount") else True
         except Exception as e:
             logger.error(f"Error deleting final publication '{topic}': {e}")
-        # Remove from in‑memory cache
-        self.session_state.get("final_publications", {}).pop(topic, None)
+        # Remove from in-memory cache
+        pop_result = self.session_state.get("final_publications", {}).pop(topic, None)
+        logger.debug(
+            f"[Memory] session_state.pop returned {pop_result!r} for topic: {topic}"
+        )
         return removed
